@@ -1,0 +1,55 @@
+"""Test that scheduler handles NULL names safely without crashing."""
+
+import asyncio
+import re
+
+import pytest
+
+from .state_utils import assert_device_name, require_service
+from .types import APIClientConnectedFactory, RunCompiledFunction
+from .wait_utils import wait_or_fail
+
+
+@pytest.mark.asyncio
+async def test_scheduler_null_name(
+    yaml_config: str,
+    run_compiled: RunCompiledFunction,
+    api_client_connected: APIClientConnectedFactory,
+) -> None:
+    """Test that scheduler handles NULL names safely without crashing."""
+
+    loop = asyncio.get_running_loop()
+    test_complete_future: asyncio.Future[bool] = loop.create_future()
+
+    # Pattern to match test completion
+    test_complete_pattern = re.compile(r"Test completed successfully")
+
+    def check_output(line: str) -> None:
+        """Check log output for test completion."""
+        if not test_complete_future.done() and test_complete_pattern.search(line):
+            test_complete_future.set_result(True)
+
+    async with (
+        run_compiled(yaml_config, line_callback=check_output),
+        api_client_connected() as client,
+    ):
+        # Verify we can connect
+        await assert_device_name(client, "scheduler-null-name")
+
+        # List services
+        _, services = await asyncio.wait_for(
+            client.list_entities_services(), timeout=5.0
+        )
+
+        # Find our test service
+        test_null_name_service = require_service(services, "test_null_name")
+
+        # Execute the test
+        await client.execute_service(test_null_name_service, {})
+
+        # Wait for test completion
+        await wait_or_fail(
+            test_complete_future,
+            10.0,
+            "Test did not complete within timeout - likely crashed due to NULL name",
+        )

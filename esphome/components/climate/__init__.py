@@ -1,0 +1,533 @@
+from typing import Any
+
+from esphome import automation
+import esphome.codegen as cg
+from esphome.components import mqtt, web_server
+import esphome.config_validation as cv
+from esphome.const import (
+    CONF_ACTION_STATE_TOPIC,
+    CONF_AWAY,
+    CONF_AWAY_COMMAND_TOPIC,
+    CONF_AWAY_STATE_TOPIC,
+    CONF_CURRENT_HUMIDITY_STATE_TOPIC,
+    CONF_CURRENT_TEMPERATURE,
+    CONF_CURRENT_TEMPERATURE_STATE_TOPIC,
+    CONF_CUSTOM_FAN_MODE,
+    CONF_CUSTOM_PRESET,
+    CONF_ENTITY_CATEGORY,
+    CONF_FAN_MODE,
+    CONF_FAN_MODE_COMMAND_TOPIC,
+    CONF_FAN_MODE_STATE_TOPIC,
+    CONF_ICON,
+    CONF_ID,
+    CONF_MAX_TEMPERATURE,
+    CONF_MIN_TEMPERATURE,
+    CONF_MODE,
+    CONF_MODE_COMMAND_TOPIC,
+    CONF_MODE_STATE_TOPIC,
+    CONF_MQTT_ID,
+    CONF_ON_CONTROL,
+    CONF_ON_STATE,
+    CONF_PRESET,
+    CONF_PRESET_COMMAND_TOPIC,
+    CONF_PRESET_STATE_TOPIC,
+    CONF_SWING_MODE,
+    CONF_SWING_MODE_COMMAND_TOPIC,
+    CONF_SWING_MODE_STATE_TOPIC,
+    CONF_TARGET_HUMIDITY_COMMAND_TOPIC,
+    CONF_TARGET_HUMIDITY_STATE_TOPIC,
+    CONF_TARGET_TEMPERATURE,
+    CONF_TARGET_TEMPERATURE_COMMAND_TOPIC,
+    CONF_TARGET_TEMPERATURE_HIGH,
+    CONF_TARGET_TEMPERATURE_HIGH_COMMAND_TOPIC,
+    CONF_TARGET_TEMPERATURE_HIGH_STATE_TOPIC,
+    CONF_TARGET_TEMPERATURE_LOW,
+    CONF_TARGET_TEMPERATURE_LOW_COMMAND_TOPIC,
+    CONF_TARGET_TEMPERATURE_LOW_STATE_TOPIC,
+    CONF_TARGET_TEMPERATURE_STATE_TOPIC,
+    CONF_TEMPERATURE_STEP,
+    CONF_VISUAL,
+    CONF_WEB_SERVER,
+)
+from esphome.core import CORE, CoroPriority, coroutine_with_priority
+from esphome.core.entity_helpers import (
+    entity_duplicate_validator,
+    queue_entity_register,
+    setup_entity,
+)
+from esphome.cpp_generator import MockObj, MockObjClass
+from esphome.types import ConfigType, SafeExpType
+
+IS_PLATFORM_COMPONENT = True
+
+CODEOWNERS = ["@esphome/core"]
+DOMAIN = "climate"
+climate_ns = cg.esphome_ns.namespace("climate")
+
+Climate = climate_ns.class_("Climate", cg.EntityBase)
+ClimateCall = climate_ns.class_("ClimateCall")
+ClimateTraits = climate_ns.class_("ClimateTraits")
+
+ClimateMode = climate_ns.enum("ClimateMode")
+CLIMATE_MODES = ClimateMode.options(
+    "OFF",
+    "HEAT_COOL",
+    "COOL",
+    "HEAT",
+    "DRY",
+    "FAN_ONLY",
+    "AUTO",
+    prefix="CLIMATE_MODE_",
+)
+validate_climate_mode = cv.enum(CLIMATE_MODES, upper=True)
+
+ClimateFanMode = climate_ns.enum("ClimateFanMode")
+CLIMATE_FAN_MODES = ClimateFanMode.options(
+    "ON",
+    "OFF",
+    "AUTO",
+    "LOW",
+    "MEDIUM",
+    "HIGH",
+    "MIDDLE",
+    "FOCUS",
+    "DIFFUSE",
+    "QUIET",
+    prefix="CLIMATE_FAN_",
+)
+
+validate_climate_fan_mode = cv.enum(CLIMATE_FAN_MODES, upper=True)
+
+ClimatePreset = climate_ns.enum("ClimatePreset")
+CLIMATE_PRESETS = ClimatePreset.options(
+    "NONE",
+    "ECO",
+    "AWAY",
+    "BOOST",
+    "COMFORT",
+    "HOME",
+    "SLEEP",
+    "ACTIVITY",
+    prefix="CLIMATE_PRESET_",
+)
+
+validate_climate_preset = cv.enum(CLIMATE_PRESETS, upper=True)
+
+ClimateSwingMode = climate_ns.enum("ClimateSwingMode")
+CLIMATE_SWING_MODES = ClimateSwingMode.options(
+    "OFF", "BOTH", "VERTICAL", "HORIZONTAL", prefix="CLIMATE_SWING_"
+)
+
+validate_climate_swing_mode = cv.enum(CLIMATE_SWING_MODES, upper=True)
+
+ClimateAction = climate_ns.enum("ClimateAction")
+CLIMATE_ACTIONS = ClimateAction.options(
+    "OFF",
+    "COOLING",
+    "HEATING",
+    "IDLE",
+    "DRYING",
+    "FAN",
+    "DEFROSTING",
+    prefix="CLIMATE_ACTION_",
+)
+
+validate_climate_action = cv.enum(CLIMATE_ACTIONS, upper=True)
+
+CONF_MIN_HUMIDITY = "min_humidity"
+CONF_MAX_HUMIDITY = "max_humidity"
+CONF_TARGET_HUMIDITY = "target_humidity"
+
+visual_temperature = cv.float_with_unit("visual_temperature", "(°|(° ?)?[CKF])?")
+
+
+VISUAL_TEMPERATURE_STEP_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_TARGET_TEMPERATURE): visual_temperature,
+        cv.Required(CONF_CURRENT_TEMPERATURE): visual_temperature,
+    }
+)
+
+
+def visual_temperature_step(value: Any) -> ConfigType:
+    # Allow defining target/current temperature steps separately
+    if isinstance(value, dict):
+        return VISUAL_TEMPERATURE_STEP_SCHEMA(value)
+
+    # Otherwise, use the single value for both properties
+    value = visual_temperature(value)
+    return VISUAL_TEMPERATURE_STEP_SCHEMA(
+        {
+            CONF_TARGET_TEMPERATURE: value,
+            CONF_CURRENT_TEMPERATURE: value,
+        }
+    )
+
+
+_CLIMATE_SCHEMA = (
+    cv.ENTITY_BASE_SCHEMA.extend(web_server.WEBSERVER_SORTING_SCHEMA)
+    .extend(cv.MQTT_COMMAND_COMPONENT_SCHEMA)
+    .extend(
+        {
+            cv.OnlyWith(CONF_MQTT_ID, "mqtt"): cv.declare_id(mqtt.MQTTClimateComponent),
+            cv.Optional(CONF_VISUAL, default={}): cv.Schema(
+                {
+                    cv.Optional(CONF_MIN_TEMPERATURE): cv.temperature,
+                    cv.Optional(CONF_MAX_TEMPERATURE): cv.temperature,
+                    cv.Optional(CONF_TEMPERATURE_STEP): visual_temperature_step,
+                    cv.Optional(CONF_MIN_HUMIDITY): cv.percentage_int,
+                    cv.Optional(CONF_MAX_HUMIDITY): cv.percentage_int,
+                }
+            ),
+            cv.Optional(CONF_ACTION_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_AWAY_COMMAND_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_AWAY_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_CURRENT_TEMPERATURE_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_CURRENT_HUMIDITY_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_FAN_MODE_COMMAND_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_FAN_MODE_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_MODE_COMMAND_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_MODE_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_PRESET_COMMAND_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_PRESET_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_SWING_MODE_COMMAND_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_SWING_MODE_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_TARGET_TEMPERATURE_COMMAND_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_TARGET_TEMPERATURE_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_TARGET_TEMPERATURE_HIGH_COMMAND_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_TARGET_TEMPERATURE_HIGH_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_TARGET_TEMPERATURE_LOW_COMMAND_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_TARGET_TEMPERATURE_LOW_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_TARGET_HUMIDITY_COMMAND_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_TARGET_HUMIDITY_STATE_TOPIC): cv.All(
+                cv.requires_component("mqtt"), cv.publish_topic
+            ),
+            cv.Optional(CONF_ON_CONTROL): automation.validate_automation(),
+            cv.Optional(CONF_ON_STATE): automation.validate_automation(),
+        }
+    )
+)
+
+
+_CLIMATE_SCHEMA.add_extra(entity_duplicate_validator("climate"))
+
+
+def climate_schema(
+    class_: MockObjClass,
+    *,
+    entity_category: str = cv.UNDEFINED,
+    icon: str = cv.UNDEFINED,
+) -> cv.Schema:
+    schema = {
+        cv.GenerateID(): cv.declare_id(class_),
+    }
+
+    for key, default, validator in [
+        (CONF_ENTITY_CATEGORY, entity_category, cv.entity_category),
+        (CONF_ICON, icon, cv.icon),
+    ]:
+        if default is not cv.UNDEFINED:
+            schema[cv.Optional(key, default=default)] = validator
+
+    return _CLIMATE_SCHEMA.extend(schema)
+
+
+_CALLBACK_AUTOMATIONS = (
+    automation.CallbackAutomation(
+        CONF_ON_STATE, "add_on_state_callback", [(Climate.operator("ref"), "x")]
+    ),
+    automation.CallbackAutomation(
+        CONF_ON_CONTROL, "add_on_control_callback", [(ClimateCall.operator("ref"), "x")]
+    ),
+)
+
+
+@setup_entity("climate")
+async def setup_climate_core_(var: MockObj, config: ConfigType) -> None:
+    visual = config.get(CONF_VISUAL, {})
+    if (min_temp := visual.get(CONF_MIN_TEMPERATURE)) is not None:
+        cg.add_define("USE_CLIMATE_VISUAL_OVERRIDES")
+        cg.add(var.set_visual_min_temperature_override(min_temp))
+    if (max_temp := visual.get(CONF_MAX_TEMPERATURE)) is not None:
+        cg.add_define("USE_CLIMATE_VISUAL_OVERRIDES")
+        cg.add(var.set_visual_max_temperature_override(max_temp))
+    if (temp_step := visual.get(CONF_TEMPERATURE_STEP)) is not None:
+        cg.add_define("USE_CLIMATE_VISUAL_OVERRIDES")
+        cg.add(
+            var.set_visual_temperature_step_override(
+                temp_step[CONF_TARGET_TEMPERATURE],
+                temp_step[CONF_CURRENT_TEMPERATURE],
+            )
+        )
+    if (min_humidity := visual.get(CONF_MIN_HUMIDITY)) is not None:
+        cg.add_define("USE_CLIMATE_VISUAL_OVERRIDES")
+        cg.add(var.set_visual_min_humidity_override(min_humidity))
+    if (max_humidity := visual.get(CONF_MAX_HUMIDITY)) is not None:
+        cg.add_define("USE_CLIMATE_VISUAL_OVERRIDES")
+        cg.add(var.set_visual_max_humidity_override(max_humidity))
+
+    if (mqtt_id := config.get(CONF_MQTT_ID)) is not None:
+        mqtt_ = cg.new_Pvariable(mqtt_id, var)
+        await mqtt.register_mqtt_component(mqtt_, config)
+
+        if (action_state_topic := config.get(CONF_ACTION_STATE_TOPIC)) is not None:
+            cg.add(mqtt_.set_custom_action_state_topic(action_state_topic))
+        if (away_command_topic := config.get(CONF_AWAY_COMMAND_TOPIC)) is not None:
+            cg.add(mqtt_.set_custom_away_command_topic(away_command_topic))
+        if (away_state_topic := config.get(CONF_AWAY_STATE_TOPIC)) is not None:
+            cg.add(mqtt_.set_custom_away_state_topic(away_state_topic))
+        if (
+            current_temperature_state_topic := config.get(
+                CONF_CURRENT_TEMPERATURE_STATE_TOPIC
+            )
+        ) is not None:
+            cg.add(
+                mqtt_.set_custom_current_temperature_state_topic(
+                    current_temperature_state_topic
+                )
+            )
+        if (
+            current_humidity_state_topic := config.get(
+                CONF_CURRENT_HUMIDITY_STATE_TOPIC
+            )
+        ) is not None:
+            cg.add(
+                mqtt_.set_custom_current_humidity_state_topic(
+                    current_humidity_state_topic
+                )
+            )
+        if (
+            fan_mode_command_topic := config.get(CONF_FAN_MODE_COMMAND_TOPIC)
+        ) is not None:
+            cg.add(mqtt_.set_custom_fan_mode_command_topic(fan_mode_command_topic))
+        if (fan_mode_state_topic := config.get(CONF_FAN_MODE_STATE_TOPIC)) is not None:
+            cg.add(mqtt_.set_custom_fan_mode_state_topic(fan_mode_state_topic))
+        if (mode_command_topic := config.get(CONF_MODE_COMMAND_TOPIC)) is not None:
+            cg.add(mqtt_.set_custom_mode_command_topic(mode_command_topic))
+        if (mode_state_topic := config.get(CONF_MODE_STATE_TOPIC)) is not None:
+            cg.add(mqtt_.set_custom_mode_state_topic(mode_state_topic))
+        if (preset_command_topic := config.get(CONF_PRESET_COMMAND_TOPIC)) is not None:
+            cg.add(mqtt_.set_custom_preset_command_topic(preset_command_topic))
+        if (preset_state_topic := config.get(CONF_PRESET_STATE_TOPIC)) is not None:
+            cg.add(mqtt_.set_custom_preset_state_topic(preset_state_topic))
+        if (
+            swing_mode_command_topic := config.get(CONF_SWING_MODE_COMMAND_TOPIC)
+        ) is not None:
+            cg.add(mqtt_.set_custom_swing_mode_command_topic(swing_mode_command_topic))
+        if (
+            swing_mode_state_topic := config.get(CONF_SWING_MODE_STATE_TOPIC)
+        ) is not None:
+            cg.add(mqtt_.set_custom_swing_mode_state_topic(swing_mode_state_topic))
+        if (
+            target_temperature_command_topic := config.get(
+                CONF_TARGET_TEMPERATURE_COMMAND_TOPIC
+            )
+        ) is not None:
+            cg.add(
+                mqtt_.set_custom_target_temperature_command_topic(
+                    target_temperature_command_topic
+                )
+            )
+        if (
+            target_temperature_state_topic := config.get(
+                CONF_TARGET_TEMPERATURE_STATE_TOPIC
+            )
+        ) is not None:
+            cg.add(
+                mqtt_.set_custom_target_temperature_state_topic(
+                    target_temperature_state_topic
+                )
+            )
+        if (
+            target_temperature_high_command_topic := config.get(
+                CONF_TARGET_TEMPERATURE_HIGH_COMMAND_TOPIC
+            )
+        ) is not None:
+            cg.add(
+                mqtt_.set_custom_target_temperature_high_command_topic(
+                    target_temperature_high_command_topic
+                )
+            )
+        if (
+            target_temperature_high_state_topic := config.get(
+                CONF_TARGET_TEMPERATURE_HIGH_STATE_TOPIC
+            )
+        ) is not None:
+            cg.add(
+                mqtt_.set_custom_target_temperature_high_state_topic(
+                    target_temperature_high_state_topic
+                )
+            )
+        if (
+            target_temperature_low_command_topic := config.get(
+                CONF_TARGET_TEMPERATURE_LOW_COMMAND_TOPIC
+            )
+        ) is not None:
+            cg.add(
+                mqtt_.set_custom_target_temperature_low_command_topic(
+                    target_temperature_low_command_topic
+                )
+            )
+        if (
+            target_temperature_low_state_topic := config.get(
+                CONF_TARGET_TEMPERATURE_LOW_STATE_TOPIC
+            )
+        ) is not None:
+            cg.add(
+                mqtt_.set_custom_target_temperature_low_state_topic(
+                    target_temperature_low_state_topic
+                )
+            )
+        if (
+            target_humidity_command_topic := config.get(
+                CONF_TARGET_HUMIDITY_COMMAND_TOPIC
+            )
+        ) is not None:
+            cg.add(
+                mqtt_.set_custom_target_humidity_command_topic(
+                    target_humidity_command_topic
+                )
+            )
+        if (
+            target_humidity_state_topic := config.get(CONF_TARGET_HUMIDITY_STATE_TOPIC)
+        ) is not None:
+            cg.add(
+                mqtt_.set_custom_target_humidity_state_topic(
+                    target_humidity_state_topic
+                )
+            )
+
+    await automation.build_callback_automations(var, config, _CALLBACK_AUTOMATIONS)
+
+    if web_server_config := config.get(CONF_WEB_SERVER):
+        await web_server.add_entity_config(var, web_server_config)
+
+
+def set_custom_fan_modes(var: MockObj, modes: list[str]) -> None:
+    """Point the climate at a shared flash table of custom fan modes."""
+    if modes:
+        table = cg.shared_progmem_array(
+            "climate_custom_fan_modes", cg.const_char_ptr, modes
+        )
+        cg.add(var.set_supported_custom_fan_modes_static(table, len(modes)))
+
+
+def set_custom_presets(var: MockObj, presets: list[str]) -> None:
+    """Point the climate at a shared flash table of custom presets."""
+    if presets:
+        table = cg.shared_progmem_array(
+            "climate_custom_presets", cg.const_char_ptr, presets
+        )
+        cg.add(var.set_supported_custom_presets_static(table, len(presets)))
+
+
+async def register_climate(var: MockObj, config: ConfigType) -> None:
+    if not CORE.has_id(config[CONF_ID]):
+        var = cg.Pvariable(config[CONF_ID], var)
+    queue_entity_register("climate", config)
+    CORE.register_platform_component("climate", var)
+    await setup_climate_core_(var, config)
+
+
+async def new_climate(config: ConfigType, *args: SafeExpType) -> MockObj:
+    var = cg.new_Pvariable(config[CONF_ID], *args)
+    await register_climate(var, config)
+    return var
+
+
+CLIMATE_CONTROL_ACTION_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_ID): cv.use_id(Climate),
+        cv.Optional(CONF_MODE): cv.templatable(validate_climate_mode),
+        cv.Optional(CONF_TARGET_TEMPERATURE): cv.templatable(cv.temperature),
+        cv.Optional(CONF_TARGET_TEMPERATURE_LOW): cv.templatable(cv.temperature),
+        cv.Optional(CONF_TARGET_TEMPERATURE_HIGH): cv.templatable(cv.temperature),
+        cv.Optional(CONF_TARGET_HUMIDITY): cv.templatable(cv.percentage_int),
+        cv.Optional(CONF_AWAY): cv.invalid("Use preset instead"),
+        cv.Exclusive(CONF_FAN_MODE, "fan_mode"): cv.templatable(
+            validate_climate_fan_mode
+        ),
+        cv.Exclusive(CONF_CUSTOM_FAN_MODE, "fan_mode"): cv.templatable(
+            cv.string_strict
+        ),
+        cv.Exclusive(CONF_PRESET, "preset"): cv.templatable(validate_climate_preset),
+        cv.Exclusive(CONF_CUSTOM_PRESET, "preset"): cv.templatable(cv.string_strict),
+        cv.Optional(CONF_SWING_MODE): cv.templatable(validate_climate_swing_mode),
+    }
+)
+
+
+automation.register_apply_action(
+    "climate.control",
+    CLIMATE_CONTROL_ACTION_SCHEMA,
+    automation.ApplyField(CONF_MODE, "set_mode", ClimateMode),
+    automation.ApplyField(CONF_TARGET_TEMPERATURE, "set_target_temperature", cg.float_),
+    automation.ApplyField(
+        CONF_TARGET_TEMPERATURE_LOW, "set_target_temperature_low", cg.float_
+    ),
+    automation.ApplyField(
+        CONF_TARGET_TEMPERATURE_HIGH, "set_target_temperature_high", cg.float_
+    ),
+    automation.ApplyField(CONF_TARGET_HUMIDITY, "set_target_humidity", cg.float_),
+    automation.ApplyField(CONF_FAN_MODE, "set_fan_mode", ClimateFanMode),
+    automation.ApplyField(
+        CONF_CUSTOM_FAN_MODE,
+        "set_fan_mode",
+        cg.std_string,
+        const_fn=automation.literal_with_length,
+    ),
+    automation.ApplyField(CONF_PRESET, "set_preset", ClimatePreset),
+    automation.ApplyField(
+        CONF_CUSTOM_PRESET,
+        "set_preset",
+        cg.std_string,
+        const_fn=automation.literal_with_length,
+    ),
+    automation.ApplyField(CONF_SWING_MODE, "set_swing_mode", ClimateSwingMode),
+    call="make_call",
+)
+
+
+@coroutine_with_priority(CoroPriority.CORE)
+async def to_code(config: ConfigType) -> None:
+    cg.add_global(climate_ns.using)

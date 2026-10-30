@@ -1,0 +1,88 @@
+"""Integration test for Home Assistant action lambdas returning strings and numbers."""
+
+from __future__ import annotations
+
+import asyncio
+import re
+
+import pytest
+
+from .state_utils import assert_device_name, require_service
+from .types import APIClientConnectedFactory, RunCompiledFunction
+from .wait_utils import wait_or_fail
+
+
+@pytest.mark.asyncio
+async def test_api_string_lambda(
+    yaml_config: str,
+    run_compiled: RunCompiledFunction,
+    api_client_connected: APIClientConnectedFactory,
+) -> None:
+    """Test Home Assistant action lambdas that return different types are sent as strings."""
+    loop = asyncio.get_running_loop()
+
+    # Track log messages for all four service calls
+    string_called_future = loop.create_future()
+    int_called_future = loop.create_future()
+    float_called_future = loop.create_future()
+    char_ptr_called_future = loop.create_future()
+
+    # Patterns to match in logs - confirms the lambdas compiled and executed
+    string_pattern = re.compile(r"Service called with string: STRING_FROM_LAMBDA")
+    int_pattern = re.compile(r"Service called with int: 42")
+    float_pattern = re.compile(r"Service called with float: 3\.14")
+    char_ptr_pattern = re.compile(r"Service called with number for char\* test: 123")
+
+    def check_output(line: str) -> None:
+        """Check log output for expected messages."""
+        if not string_called_future.done() and string_pattern.search(line):
+            string_called_future.set_result(True)
+        if not int_called_future.done() and int_pattern.search(line):
+            int_called_future.set_result(True)
+        if not float_called_future.done() and float_pattern.search(line):
+            float_called_future.set_result(True)
+        if not char_ptr_called_future.done() and char_ptr_pattern.search(line):
+            char_ptr_called_future.set_result(True)
+
+    # Run with log monitoring
+    async with (
+        run_compiled(yaml_config, line_callback=check_output),
+        api_client_connected() as client,
+    ):
+        # Verify device info
+        await assert_device_name(client, "api-string-lambda-test")
+
+        # List services to find our test services
+        _, services = await client.list_entities_services()
+
+        # Find all test services
+        string_service = require_service(services, "test_string_lambda")
+
+        int_service = require_service(services, "test_int_lambda")
+
+        float_service = require_service(services, "test_float_lambda")
+
+        char_ptr_service = require_service(services, "test_char_ptr_lambda")
+
+        # Execute all four services to test different lambda return types
+        await client.execute_service(
+            string_service, {"input_string": "STRING_FROM_LAMBDA"}
+        )
+        await client.execute_service(int_service, {"input_number": 42})
+        await client.execute_service(float_service, {"input_float": 3.14})
+        await client.execute_service(
+            char_ptr_service, {"input_number": 123, "input_string": "test_string"}
+        )
+
+        # Wait for all service log messages
+        # This confirms the lambdas compiled successfully and executed
+        await wait_or_fail(
+            asyncio.gather(
+                string_called_future,
+                int_called_future,
+                float_called_future,
+                char_ptr_called_future,
+            ),
+            5.0,
+            "One or more service log messages not received - lambda may have failed to compile or execute",
+        )

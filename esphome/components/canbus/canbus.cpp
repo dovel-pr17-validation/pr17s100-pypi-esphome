@@ -1,0 +1,170 @@
+#include "canbus.h"
+#include <algorithm>
+#include "esphome/core/application.h"
+#include "esphome/core/log.h"
+
+namespace esphome::canbus {
+
+ESPHOME_LOG_TAG(TAG, "canbus");
+
+void Canbus::setup() {
+  if (!this->setup_internal()) {
+    ESP_LOGE(TAG, "setup error!");
+    this->mark_failed();
+  }
+}
+
+void Canbus::dump_config() {
+  if (this->use_extended_id_) {
+    ESP_LOGCONFIG(TAG, "config extended id=0x%08" PRIx32, this->can_id_);
+  } else {
+    ESP_LOGCONFIG(TAG, "config standard id=0x%03" PRIx32, this->can_id_);
+  }
+}
+
+canbus::Error Canbus::send_data(uint32_t can_id, bool use_extended_id, bool remote_transmission_request,
+                                const uint8_t *data, size_t len) {
+  struct CanFrame can_message;
+
+  // Clamp before narrowing, so a lambda payload of 256 bytes or more cannot wrap to a short length
+  const uint8_t size = static_cast<uint8_t>(std::min<size_t>(len, CAN_MAX_DATA_LENGTH));
+  if (use_extended_id) {
+    ESP_LOGD(TAG, "send extended id=0x%08" PRIx32 " rtr=%s size=%d", can_id, TRUEFALSE(remote_transmission_request),
+             size);
+  } else {
+    ESP_LOGD(TAG, "send standard id=0x%03" PRIx32 " rtr=%s size=%d", can_id, TRUEFALSE(remote_transmission_request),
+             size);
+  }
+  can_message.can_data_length_code = size;
+  can_message.can_id = can_id;
+  can_message.use_extended_id = use_extended_id;
+  can_message.remote_transmission_request = remote_transmission_request;
+
+  for (int i = 0; i < size; i++) {
+    can_message.data[i] = data[i];
+    ESP_LOGVV(TAG, "  data[%d]=%02x", i, can_message.data[i]);
+  }
+
+  canbus::Error error = this->send_message(&can_message);
+  if (error != canbus::ERROR_OK) {
+    if (use_extended_id) {
+      ESP_LOGW(TAG, "send to extended id=0x%08" PRIx32 " failed with error %d!", can_id, error);
+    } else {
+      ESP_LOGW(TAG, "send to standard id=0x%03" PRIx32 " failed with error %d!", can_id, error);
+    }
+  }
+  return error;
+}
+
+void Canbus::add_trigger(CanbusTrigger *trigger) {
+  if (trigger->use_extended_id_) {
+    ESP_LOGVV(TAG, "add trigger for extended canid=0x%08" PRIx32, trigger->can_id_);
+  } else {
+    ESP_LOGVV(TAG, "add trigger for std canid=0x%03" PRIx32, trigger->can_id_);
+  }
+  this->triggers_.push_back(trigger);
+};
+
+void Canbus::loop() {
+  uint32_t now = App.get_loop_component_start_time();
+  if ((now - this->last_event_check_time_) >= EVENT_CHECK_INTERVAL_MS) {
+    this->log_events_(this->get_events(), now);
+    this->last_event_check_time_ = now;
+  }
+
+  struct CanFrame can_message;
+  uint32_t message_counter = 0;
+  for (; message_counter < this->max_frames_per_loop_; message_counter++) {
+    if (this->read_message(&can_message) != canbus::ERROR_OK) {
+      break;
+    }
+
+    if (can_message.use_extended_id) {
+      ESP_LOGD(TAG, "received can message (#%" PRIu32 ") extended can_id=0x%" PRIx32 " size=%d", message_counter + 1,
+               can_message.can_id, can_message.can_data_length_code);
+    } else {
+      ESP_LOGD(TAG, "received can message (#%" PRIu32 ") std can_id=0x%" PRIx32 " size=%d", message_counter + 1,
+               can_message.can_id, can_message.can_data_length_code);
+    }
+
+    std::vector<uint8_t> data;
+
+    // show data received
+    for (int i = 0; i < std::min(can_message.can_data_length_code, CAN_MAX_DATA_LENGTH); i++) {
+      ESP_LOGV(TAG, "  can_message.data[%d]=%02x", i, can_message.data[i]);
+      data.push_back(can_message.data[i]);
+    }
+
+    this->callback_manager_(can_message.can_id, can_message.use_extended_id, can_message.remote_transmission_request,
+                            data);
+
+    // fire all triggers
+    for (auto *trigger : this->triggers_) {
+      if ((trigger->can_id_ == (can_message.can_id & trigger->can_id_mask_)) &&
+          (trigger->use_extended_id_ == can_message.use_extended_id) &&
+          (!trigger->remote_transmission_request_.has_value() ||
+           trigger->remote_transmission_request_.value() == can_message.remote_transmission_request)) {
+        trigger->trigger(data, can_message.can_id, can_message.remote_transmission_request);
+      }
+    }
+  }
+
+  if (message_counter == this->max_frames_per_loop_) {
+    ESP_LOGW(TAG,
+             "Reached max_frames_per_loop=%" PRIu32 ", deferring remaining CAN frames. Some frames might be dropped",
+             this->max_frames_per_loop_);
+  }
+}
+
+void Canbus::log_events_(CanEventFlags events, uint32_t now) {
+  // Bus-off gets its own handling because automatic recovery can make it flap
+  if (events & CanEventFlags::CAN_EVENT_BUS_OFF) {
+    this->last_bus_off_time_ = now;
+    if (!this->bus_off_) {
+      this->bus_off_ = true;
+      this->status_set_warning(LOG_STR("Bus off"));
+    }
+  } else if (this->bus_off_) {
+    if ((now - this->last_bus_off_time_) >= EVENT_LOG_BUS_OFF_HOLDOFF_MS) {
+      // No bus-off event for the hold-off time, so ask whether it is really over
+      if (this->get_status().bus_off) {
+        this->last_bus_off_time_ = now;
+      } else {
+        this->bus_off_ = false;
+        this->status_clear_warning();
+        // Events gathered while bus-off say nothing about the recovered bus
+        this->events_to_log_ = 0;
+      }
+    }
+  } else {
+    this->events_to_log_ |= events;
+    if (this->events_to_log_ != 0 && (now - this->last_event_log_time_) >= EVENT_LOG_THROTTLE_MS) {
+      if (this->events_to_log_ & (CanEventFlags::CAN_EVENT_PASSIVE | CanEventFlags::CAN_EVENT_ACTIVE)) {
+        bool error_passive = this->events_to_log_ & CanEventFlags::CAN_EVENT_PASSIVE;
+        if (error_passive && (this->events_to_log_ & CanEventFlags::CAN_EVENT_ACTIVE)) {
+          // Both edges within one throttle window, so the counters decide the current state
+          auto status = this->get_status();
+          error_passive = status.rx_error_counter >= CAN_ERROR_PASSIVE_THRESHOLD ||
+                          status.tx_error_counter >= CAN_ERROR_PASSIVE_THRESHOLD;
+        }
+        ESP_LOGW(TAG, "entered %s", error_passive ? LOG_STR_LITERAL("error-passive") : LOG_STR_LITERAL("error-active"));
+      }
+      if (this->events_to_log_ & CanEventFlags::CAN_EVENT_RX_QUEUE_FULL) {
+        ESP_LOGD(TAG, "receive buffer overrun");
+      }
+      this->events_to_log_ = 0;
+      this->last_event_log_time_ = now;
+    }
+  }
+
+#ifdef ESPHOME_LOG_HAS_VERBOSE
+  if ((now - this->last_state_log_time_) >= STATE_LOG_INTERVAL_MS) {
+    auto status = this->get_status();
+    ESP_LOGV(TAG, "Status: bus_off %d, tx_err %d, rx_err %d", status.bus_off, status.tx_error_counter,
+             status.rx_error_counter);
+    this->last_state_log_time_ = now;
+  }
+#endif
+}
+
+}  // namespace esphome::canbus
